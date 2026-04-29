@@ -8,6 +8,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
+from astrbot.core.message.message_event_result import MessageChain
 
 from PIL import Image as PILImage
 from astrbot.api.event import filter, AstrMessageEvent
@@ -20,45 +21,43 @@ from astrbot.core.message.message_event_result import MessageChain
 class GPTImage2Plugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-
-        # 获取数据根目录（兼容不同环境）
-        data_root = Path.cwd() / "data"  # AstrBot 默认工作目录即为项目根目录
-        logger.info(f"数据根目录: {data_root}")
-
-        # 配置文件路径：使用框架标准插件配置存储位置
-        config_path = data_root / "plugin_config" / "gpt-image2.json"
-
+        
+        # 获取数据目录（兼容不同环境，直接使用相对路径，因为 AstrBot 的工作目录就是项目根目录）
+        data_root = Path("data")
+        logger.info(f"数据根目录: {data_root.absolute()}")
+        
+        # 插件配置文件标准路径
+        config_path = data_root / "config" / "astrbot_plugin_gpt-image-2_config.json"
+        logger.info(f"尝试加载配置文件: {config_path.absolute()}")
+        
         if config_path.exists():
             try:
                 with open(config_path, "r", encoding="utf-8-sig") as f:
                     cfg = json.load(f)
-                logger.info(f"✅ 配置文件加载成功: {config_path}")
+                logger.info(f"✅ 配置文件加载成功")
             except Exception as e:
                 logger.error(f"❌ 配置文件读取失败: {e}")
                 cfg = {}
         else:
-            logger.warning(f"⚠️ 配置文件不存在: {config_path}，使用默认配置")
+            logger.warning(f"⚠️ 配置文件不存在，使用默认配置")
             cfg = {}
-
-        # 图片存储目录（绝对路径）
+        
+        # 图片目录
         self.img_dir = data_root / "plugin_data" / "gpt-image2" / "images"
         self.img_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"✅ 图片目录已准备: {self.img_dir}")
-
-        # 配置字段
+        
+        # 读取全局配置
         self.api_url = cfg.get("api_url", "https://api.apimart.ai/v1").rstrip("/")
         self.api_key = cfg.get("api_key", "")
         self.whitelist = cfg.get("whitelist", [])
         self.daily_limit = cfg.get("daily_limit", 10)
-        self.max_retries = cfg.get("max_retries", 10)          # 默认10次
-        self.poll_interval = cfg.get("poll_interval", 2)       # 默认2秒
+        self.max_retries = cfg.get("max_retries", 10)
+        self.poll_interval = cfg.get("poll_interval", 2)
         self.default_preset = cfg.get("default_preset", "default")
+        
+        # 直接获取预设列表（框架已展开为 list[dict]）
         self.presets = cfg.get("presets", [])
-
-        # 诊断输出
-        safe_cfg = {k: v for k, v in cfg.items() if k != 'api_key'}
-        logger.info(f"📋 配置摘要 (无api_key): {json.dumps(safe_cfg, ensure_ascii=False)}")
-        logger.info(f"🔍 presets 类型: {type(self.presets).__name__}, 内容: {json.dumps(self.presets, ensure_ascii=False)}")
+        logger.info(f"📋 预设数量: {len(self.presets)}，预设列表: {json.dumps(self.presets, ensure_ascii=False)}")
 
     # ---------- 工具函数 ----------
     async def _check_permission(self, event: AstrMessageEvent) -> tuple[bool, str]:
@@ -317,23 +316,20 @@ class GPTImage2Plugin(Star):
     @filter.command("draw")
     async def draw(self, event: AstrMessageEvent):
         '''/draw [预设ID] <提示词>  生成图片'''
-        logger.info(f"🔎 [DEBUG] self.presets = {json.dumps(self.presets, ensure_ascii=False)}, type = {type(self.presets).__name__}")
-
-        # 权限检查
+        logger.info(f"🔎 [DEBUG] self.presets = {json.dumps(self.presets, ensure_ascii=False)}")
         try:
             allowed, reason = await self._check_permission(event)
             if not allowed:
-                await event.send(MessageChain().message(reason))
+                yield event.plain_result(reason)
                 return
         except Exception as e:
             logger.error(f"权限检查异常: {e}")
-            await event.send(MessageChain().message("内部错误：权限检查失败，请稍后重试。"))
+            yield event.plain_result("内部错误：权限检查失败，请稍后重试。")
             return
 
-        # 参数解析
         parts = event.message_str.strip().split()
         if len(parts) < 2:
-            await event.send(MessageChain().message("格式：/draw [预设ID] <提示词>"))
+            yield event.plain_result("格式：/draw [预设ID] <提示词>")
             return
 
         if len(parts) >= 3:
@@ -346,35 +342,32 @@ class GPTImage2Plugin(Star):
         preset = self._find_preset(preset_id)
         if not preset:
             preset_list = ', '.join([p.get('id', '?') for p in self.presets]) if self.presets else "无"
-            await event.send(MessageChain().message(f"未找到预设 '{preset_id}'，当前可用预设：{preset_list}"))
+            yield event.plain_result(f"未找到预设 '{preset_id}'，当前可用预设：{preset_list}")
             return
 
         sender_id = str(event.get_sender_id())
 
-        # 提交任务
         try:
             submit_resp = await self._submit_task(preset, prompt)
         except Exception as e:
             logger.error(f"提交任务异常: {e}")
-            await event.send(MessageChain().message("提交生成任务时发生内部错误。"))
+            yield event.plain_result("提交生成任务时发生内部错误。")
             return
 
         if "error" in submit_resp:
-            await event.send(MessageChain().message(f"提交任务失败：{submit_resp['error']}"))
+            yield event.plain_result(f"提交任务失败：{submit_resp['error']}")
             return
 
         task_id = submit_resp.get("task_id")
         if not task_id:
-            await event.send(MessageChain().message("API 未返回 task_id，请检查 API 配置。"))
+            yield event.plain_result("API 未返回 task_id，请检查 API 配置。")
             return
 
-        # 记录使用次数
         try:
             await self._inc_usage(sender_id)
         except Exception as e:
             logger.error(f"增加次数失败: {e}")
 
-        # 保存任务信息
         task_info = {
             "task_id": task_id,
             "sender_id": sender_id,
@@ -389,19 +382,98 @@ class GPTImage2Plugin(Star):
         except Exception as e:
             logger.error(f"保存任务信息失败: {e}")
 
-        # 回复预设消息
         reply_template = preset.get("reply", "图库搜寻中… 任务 ID：{task_id}")
         try:
             reply_text = reply_template.format(task_id=task_id, prompt=prompt)
         except Exception:
             reply_text = f"任务已提交，ID: {task_id}"
-        await event.send(MessageChain().message(reply_text))
+        yield event.plain_result(reply_text)
+
+        asyncio.create_task(self._background_polling(task_id))
+
+
+    @filter.llm_tool(name="draw_image")
+    async def draw_image_tool(self, event: AstrMessageEvent, prompt: str, preset_id: str = ""):
+        '''生成一张图片。当用户要求画图、生成图片、创作图像、设计海报等与图像生成相关的请求时调用此工具。
+        Args:
+            prompt(string): 图片描述提示词
+            preset_id(string): 预设配置ID，不填则使用默认预设
+        '''
+        logger.info(f"LLM工具 draw_image 被调用，prompt={prompt}, preset_id={preset_id}")
+        
+        # 使用默认预设
+        if not preset_id:
+            preset_id = self.default_preset
+        
+        preset = self._find_preset(preset_id)
+        if not preset:
+            preset_list = ', '.join([p.get('id', '?') for p in self.presets]) if self.presets else "无"
+            yield event.plain_result(f"未找到预设 '{preset_id}'，当前可用预设：{preset_list}")
+            return
+
+        # 权限检查
+        try:
+            allowed, reason = await self._check_permission(event)
+            if not allowed:
+                yield event.plain_result(reason)
+                return
+        except Exception as e:
+            logger.error(f"权限检查异常: {e}")
+            yield event.plain_result("内部错误：权限检查失败，请稍后重试。")
+            return
+
+        sender_id = str(event.get_sender_id())
+
+        # 提交任务（复用你的 _submit_task）
+        try:
+            submit_resp = await self._submit_task(preset, prompt)
+        except Exception as e:
+            logger.error(f"提交任务异常: {e}")
+            yield event.plain_result("提交生成任务时发生内部错误。")
+            return
+
+        if "error" in submit_resp:
+            yield event.plain_result(f"提交任务失败：{submit_resp['error']}")
+            return
+
+        task_id = submit_resp.get("task_id")
+        if not task_id:
+            yield event.plain_result("API 未返回 task_id，请检查 API 配置。")
+            return
+
+        try:
+            await self._inc_usage(sender_id)
+        except Exception as e:
+            logger.error(f"增加次数失败: {e}")
+
+        task_info = {
+            "task_id": task_id,
+            "sender_id": sender_id,
+            "umo": event.unified_msg_origin,
+            "preset_id": preset_id,
+            "prompt": prompt,
+            "status": "submitted",
+            "created_at": time.time()
+        }
+        try:
+            await self.put_kv_data(f"task_{task_id}", json.dumps(task_info))
+        except Exception as e:
+            logger.error(f"保存任务信息失败: {e}")
+
+        reply_template = preset.get("reply", "图库搜寻中… 任务 ID：{task_id}")
+        try:
+            reply_text = reply_template.format(task_id=task_id, prompt=prompt)
+        except Exception:
+            reply_text = f"任务已提交，ID: {task_id}"
+        yield event.plain_result(reply_text)
 
         # 启动后台轮询
         asyncio.create_task(self._background_polling(task_id))
 
+
     @filter.command("check")
     async def check_task(self, event: AstrMessageEvent):
+        '''/check <任务ID>  查询任务状态'''
         try:
             parts = event.message_str.strip().split()
             if len(parts) < 2:
