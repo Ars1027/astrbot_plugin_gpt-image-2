@@ -400,52 +400,56 @@ class GPTImage2Plugin(Star):
             preset_id(string): 预设配置ID，不填则使用默认预设
         '''
         logger.info(f"LLM工具 draw_image 被调用，prompt={prompt}, preset_id={preset_id}")
-        
+
         # 使用默认预设
         if not preset_id:
             preset_id = self.default_preset
-        
+
         preset = self._find_preset(preset_id)
         if not preset:
             preset_list = ', '.join([p.get('id', '?') for p in self.presets]) if self.presets else "无"
-            yield event.plain_result(f"未找到预设 '{preset_id}'，当前可用预设：{preset_list}")
-            return
+            error_msg = f"未找到预设 '{preset_id}'，当前可用预设：{preset_list}"
+            await event.send(MessageChain().message(error_msg))
+            return error_msg
 
         # 权限检查
         try:
             allowed, reason = await self._check_permission(event)
             if not allowed:
-                yield event.plain_result(reason)
-                return
+                await event.send(MessageChain().message(reason))
+                return reason
         except Exception as e:
             logger.error(f"权限检查异常: {e}")
-            yield event.plain_result("内部错误：权限检查失败，请稍后重试。")
-            return
+            await event.send(MessageChain().message("内部错误：权限检查失败，请稍后重试。"))
+            return "权限检查异常"
 
         sender_id = str(event.get_sender_id())
 
-        # 提交任务（复用你的 _submit_task）
+        # 提交任务
         try:
             submit_resp = await self._submit_task(preset, prompt)
         except Exception as e:
             logger.error(f"提交任务异常: {e}")
-            yield event.plain_result("提交生成任务时发生内部错误。")
-            return
+            await event.send(MessageChain().message("提交生成任务时发生内部错误。"))
+            return "提交任务失败"
 
         if "error" in submit_resp:
-            yield event.plain_result(f"提交任务失败：{submit_resp['error']}")
-            return
+            error_msg = f"提交任务失败：{submit_resp['error']}"
+            await event.send(MessageChain().message(error_msg))
+            return error_msg
 
         task_id = submit_resp.get("task_id")
         if not task_id:
-            yield event.plain_result("API 未返回 task_id，请检查 API 配置。")
-            return
+            await event.send(MessageChain().message("API 未返回 task_id，请检查 API 配置。"))
+            return "API 未返回 task_id"
 
+        # 记录使用次数
         try:
             await self._inc_usage(sender_id)
         except Exception as e:
             logger.error(f"增加次数失败: {e}")
 
+        # 保存任务信息
         task_info = {
             "task_id": task_id,
             "sender_id": sender_id,
@@ -460,15 +464,19 @@ class GPTImage2Plugin(Star):
         except Exception as e:
             logger.error(f"保存任务信息失败: {e}")
 
+        # 回复预设消息（通过 event.send 主动发送，不阻塞）
         reply_template = preset.get("reply", "图库搜寻中… 任务 ID：{task_id}")
         try:
             reply_text = reply_template.format(task_id=task_id, prompt=prompt)
         except Exception:
             reply_text = f"任务已提交，ID: {task_id}"
-        yield event.plain_result(reply_text)
+        await event.send(MessageChain().message(reply_text))
 
         # 启动后台轮询
         asyncio.create_task(self._background_polling(task_id))
+
+        # 必须返回一个字符串给 LLM，表示任务已提交
+        return f"图片生成任务已提交，任务ID: {task_id}"
 
 
     @filter.command("check")
