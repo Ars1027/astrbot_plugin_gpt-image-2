@@ -4,6 +4,7 @@ import os
 import time
 import traceback
 import aiohttp
+import random
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
@@ -20,8 +21,9 @@ class GPTImage2Plugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
-        # 获取 AstrBot 数据根目录（绝对路径，跨环境安全）
-        data_root = Path(context.astrbot_data_path)
+        # 获取数据根目录（兼容不同环境）
+        data_root = Path.cwd() / "data"  # AstrBot 默认工作目录即为项目根目录
+        logger.info(f"数据根目录: {data_root}")
 
         # 配置文件路径：使用框架标准插件配置存储位置
         config_path = data_root / "plugin_config" / "gpt-image2.json"
@@ -96,13 +98,30 @@ class GPTImage2Plugin(Star):
         return None
 
     async def _submit_task(self, preset: dict, prompt: str) -> dict:
+        """提交任务，返回 API 响应 JSON 或含 error 字段的 dict"""
+        # 1. 处理图片尺寸（支持分类标题随机）
+        size_raw = preset.get("size", "1:1")
+        SIZE_CATEGORIES = {
+            "---- 方形 ----": ["1:1"],
+            "---- 横屏 ----": ["16:9", "3:2", "4:3", "2:1", "21:9", "5:4"],
+            "---- 竖屏 ----": ["9:16", "2:3", "3:4", "1:2", "9:21", "4:5"]
+        }
+        if size_raw in SIZE_CATEGORIES:
+            size = random.choice(SIZE_CATEGORIES[size_raw])
+            logger.info(f"用户选择了分类 '{size_raw}'，随机抽取比例：{size}")
+        else:
+            size = size_raw
+
+        # 2. 构建请求体
         payload = {
             "model": "gpt-image-2",
             "prompt": prompt,
-            "size": preset.get("size", "1:1"),
+            "size": size,
             "resolution": preset.get("resolution", "2k"),
             "n": preset.get("n", 1),
         }
+
+        # 3. 合并自定义参数
         custom_str = preset.get("custom", "").strip()
         if custom_str:
             try:
@@ -113,6 +132,7 @@ class GPTImage2Plugin(Star):
             except Exception as e:
                 return {"error": f"自定义参数解析异常：{e}"}
 
+        # 4. 发送 API 请求
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -131,7 +151,7 @@ class GPTImage2Plugin(Star):
                     response_json = await resp.json()
                     logger.info(f"=== API 提交返回 == {json.dumps(response_json, ensure_ascii=False)}")
 
-                    # 解析 task_id（兼容 APIMart 格式）
+                    # 提取 task_id
                     if response_json.get("code") == 200:
                         data_list = response_json.get("data", [])
                         if isinstance(data_list, list) and data_list:
