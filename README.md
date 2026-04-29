@@ -1,6 +1,3 @@
-以下是根据你的插件实际功能编写的全新 README 文档，可直接替换 `README.md` 使用：
-
-```markdown
 # astrbot_plugin_gpt-image-2
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-v4.23.6+-blue)](https://github.com/AstrBotDevs/AstrBot)
@@ -161,5 +158,3 @@ pillow
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) — 松耦合、多平台、易扩展的聊天机器人开发框架。
 - [APIMart](https://apimart.ai) — AI 模型聚合与 API 平台，提供 GPT-Image-2 图片生成服务。
 ```
-
-这个新 README 涵盖了项目简介、核心特性、安装配置、使用指南、技术架构、依赖与致谢等完整内容，与你的实际插件功能完全一致。直接复制覆盖仓库中的 `README.md` 即可。
