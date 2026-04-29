@@ -1,0 +1,96 @@
+{
+  "api_url": {
+    "description": "API 基础地址",
+    "type": "string",
+    "default": "https://api.apimart.ai/v1"
+  },
+  "api_key": {
+    "description": "API Key（从 APIMart 获取）",
+    "type": "string",
+    "hint": "用于认证 GPT-Image-2 服务",
+    "obvious_hint": true
+  },
+  "whitelist": {
+    "description": "用户白名单（留空则所有人可用）",
+    "type": "list",
+    "default": [],
+    "hint": "填写 QQ 号或平台用户 ID"
+  },
+  "daily_limit": {
+    "description": "每日每人使用次数上限",
+    "type": "int",
+    "default": 10,
+    "hint": "0 表示不限制"
+  },
+  "max_retries": {
+    "description": "最大轮询次数",
+    "type": "int",
+    "default": 10,
+    "hint": "超过此次数后任务视为失败"
+  },
+  "poll_interval": {
+    "description": "轮询间隔（秒）",
+    "type": "int",
+    "default": 2,
+    "hint": "建议 2-5 秒"
+  },
+  "default_preset": {
+    "description": "默认预设",
+    "type": "string",
+    "default": "default",
+    "hint": "当 /draw 不指定预设ID时自动使用此预设。"
+  },
+  "presets": {
+    "description": "预设配置列表",
+    "type": "template_list",
+    "templates": {
+      "default": {
+        "name": "默认",
+        "hint": "默认的图片生成配置",
+        "items": {
+          "id": {
+            "description": "预设 ID",
+            "type": "string",
+            "default": "default",
+            "hint": "用于 /draw <ID> <提示词> 命令中切换预设。"
+          },
+          "name": {
+            "description": "预设名称",
+            "type": "string",
+            "default": "默认"
+          },
+          "reply": {
+            "description": "回复模板",
+            "type": "string",
+            "default": "图库搜寻中… 任务 ID：{task_id}",
+            "hint": "支持 {task_id} 和 {prompt}"
+          },
+          "size": {
+            "description": "图片比例",
+            "type": "string",
+            "default": "1:1",
+            "options": ["auto", "1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16", "2:1", "1:2", "21:9", "9:21", "5:4", "4:5"]
+          },
+          "resolution": {
+            "description": "分辨率",
+            "type": "string",
+            "default": "2k",
+            "options": ["1k", "2k", "4k"]
+          },
+          "n": {
+            "description": "生成张数",
+            "type": "int",
+            "default": 1,
+            "hint": "通常为 1"
+          },
+          "custom": {
+            "description": "附加 JSON 参数",
+            "type": "string",
+            "default": "",
+            "hint": "可选，合法的 JSON 对象"
+          }
+        }
+      }
+    }
+  }
+}
