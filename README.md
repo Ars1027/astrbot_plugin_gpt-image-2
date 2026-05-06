@@ -2,7 +2,7 @@
 
 
 <img src="https://github.com/Ars1027/astrbot_plugin_gpt-image-2/blob/master/logo.png" width="256" alt="icon">
-
+</div>
 # astrbot_plugin_gpt-image-2
 
 [![AstrBot](https://img.shields.io/badge/AstrBot-v4.16.0+-blue)](https://github.com/AstrBotDevs/AstrBot)
