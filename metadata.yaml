@@ -1,7 +1,7 @@
-name: "astrbot_plugin_gpt-image-2" # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
-display_name: "调用GPT image 2" # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: "能够让AstrBot调用GPT image 2 来生成图片并通过异步获取图片的插件。" # 插件简短描述
-version: "v1.0" # 插件版本号。格式：v1.1.1 或者 v1.1
-author: "Luochang" # 作者
-repo: "https://github.com/swt2665048148-arch/astrbot_plugin_gpt-image-2" # 插件的仓库地址
+name: "astrbot_plugin_gpt_image_2"
+display_name: "GPT-Image-2 文生图/图生图"
+desc: "调用 GPT-Image-2 API 生成图片，支持文生图和图生图（引用图片）"
+version: "v2.0.0"
+author: "Luochang"
+repo: "https://github.com/swt2665048148-arch/astrbot_plugin_gpt-image-2"
 astrbot_version: ">=4.16.0"
