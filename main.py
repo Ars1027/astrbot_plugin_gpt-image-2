@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import io
 import json
 import re
 import time
@@ -37,11 +39,15 @@ VALID_RESOLUTIONS = {"1k", "2k", "4k"}
 # 支持的质量
 VALID_QUALITIES = {"auto", "low", "medium", "high"}
 
-# 参数解析正则：匹配 16:9@4k low、3:4 medium、1:1 high、21:9@2k auto 等
-PARAM_PATTERN = re.compile(
-    r"^(?:(\d+:\d+|auto)@)?(1k|2k|4k)?\s*(auto|low|medium|high)?\s*$"
-)
-
+# APIMart 上传接口限制：单张图片最大 20MB。
+MAX_REFERENCE_IMAGE_BYTES = 20 * 1024 * 1024
+IMAGE_CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
 
 @register(
     "gpt-image-2",
@@ -82,43 +88,66 @@ class GPTImage2Plugin(Star):
     async def terminate(self):
         """插件卸载时调用"""
         if self.session:
-            await self.session.aclose()
+            await self.session.close()
             self.session = None
         logger.info("GPT-Image-2 插件已卸载")
 
     # ========== 参数解析 ==========
 
-    def _parse_params(self, param_str: str) -> dict | None:
+    def _parse_draw_args(self, arg_str: str) -> tuple[dict, str, str]:
         """
-        解析参数字符串，返回 {size, resolution, quality} 或 None（无效参数）
+        解析 /draw 后的参数和提示词，返回 (params, prompt, error_msg)。
 
-        支持格式：
-        - 16:9@4k low
+        参数必须是空格分隔的前置 token：
+        - 16:9 2k high
         - 3:4 medium
-        - 1:1 high
-        - 21:9@2k auto
-        - low（仅质量）
-        - 16:9（仅比例）
+        - low
+        - 2k
         """
-        param_str = param_str.strip()
-        if not param_str:
-            return {}
+        tokens = arg_str.strip().split()
+        params = {}
+        labels = {
+            "size": "宽高比",
+            "resolution": "分辨率",
+            "quality": "质量",
+        }
 
-        match = PARAM_PATTERN.match(param_str)
-        if not match:
+        for index, token in enumerate(tokens):
+            value = token.lower()
+
+            if "@" in value:
+                return (
+                    {},
+                    "",
+                    "参数格式错误：不再支持 @ 写法，请使用空格分隔，"
+                    "例如：/draw 4:3 2k medium 一只狗",
+                )
+
+            param_name = ""
+            if value == "auto":
+                # auto 既可以是宽高比也可以是质量；优先作为宽高比解析。
+                param_name = "size" if "size" not in params else "quality"
+            elif value in VALID_SIZES or re.fullmatch(r"\d+:\d+", value):
+                param_name = "size"
+            elif value in VALID_RESOLUTIONS or re.fullmatch(r"\d+k", value):
+                param_name = "resolution"
+            elif value in VALID_QUALITIES:
+                param_name = "quality"
+            else:
+                return params, " ".join(tokens[index:]).strip(), ""
+
+            if param_name in params:
+                return {}, "", f"参数重复：{labels[param_name]}"
+            params[param_name] = value
+
+        return params, "", "请提供提示词，例如：/draw 4:3 2k medium 一只狗"
+
+    def _parse_params(self, param_str: str) -> dict | None:
+        """兼容旧内部调用：只解析空格分隔参数，不包含提示词。"""
+        params, prompt, error = self._parse_draw_args(f"{param_str} __prompt__")
+        if error or prompt != "__prompt__":
             return None
-
-        size, resolution, quality = match.groups()
-        result = {}
-
-        if size:
-            result["size"] = size
-        if resolution:
-            result["resolution"] = resolution
-        if quality:
-            result["quality"] = quality
-
-        return result
+        return params
 
     def _validate_params(self, params: dict) -> tuple[bool, str]:
         """验证参数是否合法，返回 (valid, error_msg)"""
@@ -202,7 +231,7 @@ class GPTImage2Plugin(Star):
     ) -> dict:
         """提交图片生成任务，返回 API 响应"""
         payload = {
-            "model": "gpt-image-2-official",
+            "model": "gpt-image-2",
             "prompt": prompt,
             "size": params.get("size", self.default_size),
             "resolution": params.get("resolution", self.default_resolution),
@@ -236,6 +265,107 @@ class GPTImage2Plugin(Star):
         except Exception as e:
             logger.error(f"提交任务网络异常: {e}")
             return {"error": f"网络连接失败: {e}"}
+
+    async def _download_reference_image(
+        self, url: str, index: int
+    ) -> tuple[bytes, str, str]:
+        """下载引用图片，返回 (content, filename, content_type)。"""
+        try:
+            async with self.session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise ValueError(f"下载引用图片失败：HTTP {resp.status}: {body[:200]}")
+
+                content = await resp.read()
+                if not content:
+                    raise ValueError("下载引用图片失败：响应内容为空")
+                if len(content) > MAX_REFERENCE_IMAGE_BYTES:
+                    size_mb = len(content) / 1024 / 1024
+                    raise ValueError(f"引用图片过大：{size_mb:.1f}MB，最大支持 20MB")
+
+                content_type = self._detect_image_content_type(
+                    resp.headers.get("Content-Type", ""),
+                    content,
+                )
+                if content_type not in IMAGE_CONTENT_TYPE_EXTENSIONS:
+                    raise ValueError(
+                        f"引用图片格式不支持：{content_type or '未知'}，"
+                        "请使用 JPEG、PNG、WebP 或 GIF"
+                    )
+
+                return self._normalize_reference_image(content, content_type, index)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"下载引用图片失败：{e}") from e
+
+    def _detect_image_content_type(self, header: str, content: bytes) -> str:
+        """优先使用响应头，缺失或不规范时按文件头识别图片格式。"""
+        content_type = header.split(";")[0].strip().lower()
+        if content_type in IMAGE_CONTENT_TYPE_EXTENSIONS:
+            return "image/jpeg" if content_type == "image/jpg" else content_type
+
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            return "image/webp"
+        if content.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+
+        return content_type
+
+    def _normalize_reference_image(
+        self, content: bytes, content_type: str, index: int
+    ) -> tuple[bytes, str, str]:
+        """将上游不支持的 GIF 转成首帧 PNG，其余格式保持原样。"""
+        if content_type != "image/gif":
+            filename = f"reference_{index}{IMAGE_CONTENT_TYPE_EXTENSIONS[content_type]}"
+            return content, filename, content_type
+
+        try:
+            from PIL import Image
+
+            with Image.open(io.BytesIO(content)) as image:
+                image.seek(0)
+                frame = image.copy()
+
+            if frame.mode not in ("RGB", "RGBA"):
+                frame = frame.convert("RGBA")
+
+            output = io.BytesIO()
+            frame.save(output, format="PNG")
+            converted = output.getvalue()
+        except Exception as e:
+            raise ValueError(f"GIF 首帧转换失败：{e}") from e
+
+        if len(converted) > MAX_REFERENCE_IMAGE_BYTES:
+            size_mb = len(converted) / 1024 / 1024
+            raise ValueError(f"GIF 首帧转换后过大：{size_mb:.1f}MB，最大支持 20MB")
+
+        logger.info("检测到 GIF 引用图片，已截取第一帧并转换为 PNG")
+        return converted, f"reference_{index}.png", "image/png"
+
+    def _to_data_uri(self, content: bytes, content_type: str) -> str:
+        """将引用图片编码成 JSON 可传递的 data URI。"""
+        encoded = base64.b64encode(content).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
+
+    async def _prepare_reference_images(self, image_urls: list[str]) -> list[str]:
+        """将平台引用图转换成 data URI，避免生成接口收到 multipart 请求。"""
+        data_urls = []
+        for index, url in enumerate(image_urls, start=1):
+            content, filename, content_type = await self._download_reference_image(
+                url, index
+            )
+            data_urls.append(self._to_data_uri(content, content_type))
+            logger.info(f"引用图片已转换为 data URI: {filename}")
+
+        return data_urls
 
     async def _poll_task(self, task_id: str) -> dict:
         """轮询任务状态，返回任务结果或错误"""
@@ -458,10 +588,10 @@ class GPTImage2Plugin(Star):
         /draw [参数] <提示词>  生成图片（支持图生图）
 
         参数格式：
-        - 16:9@4k low
+        - 16:9 4k low
         - 3:4 medium
         - 1:1 high
-        - 21:9@2k auto
+        - 2k low
         - low（仅质量）
         - 16:9（仅比例）
 
@@ -479,29 +609,18 @@ class GPTImage2Plugin(Star):
         if len(parts) < 2:
             yield event.plain_result(
                 "格式：/draw [参数] <提示词>\n"
-                "参数示例：16:9@4k low、3:4 medium、1:1 high\n"
+                "参数示例：16:9 4k low、3:4 medium、1:1 high\n"
                 "图生图：引用一张图片后发送 /draw <提示词>"
             )
             return
 
         remaining = parts[1]
 
-        # 尝试解析参数部分
-        params = {}
-        prompt = remaining
-
-        # 尝试从开头匹配参数
-        param_match = re.match(
-            r"^((?:\d+:\d+|auto)(?:@[124]k)?\s*(?:auto|low|medium|high)?)\s+(.+)",
-            remaining,
-            re.IGNORECASE,
-        )
-        if param_match:
-            param_str = param_match.group(1)
-            parsed = self._parse_params(param_str)
-            if parsed is not None:
-                params = parsed
-                prompt = param_match.group(2)
+        # 解析空格分隔的前置参数；第一个非参数 token 开始作为提示词。
+        params, prompt, parse_error = self._parse_draw_args(remaining)
+        if parse_error:
+            yield event.plain_result(parse_error)
+            return
 
         # 验证参数
         valid, err_msg = self._validate_params(params)
@@ -516,8 +635,15 @@ class GPTImage2Plugin(Star):
             "quality": params.get("quality", self.default_quality),
         }
 
-        # 获取引用图片（图生图）
+        # 获取并转存引用图片（图生图）
         image_urls = await self._get_quoted_image_urls(event)
+        if image_urls:
+            try:
+                image_urls = await self._prepare_reference_images(image_urls)
+            except ValueError as e:
+                logger.error(f"处理引用图片失败: {e}")
+                yield event.plain_result(str(e))
+                return
 
         sender_id = str(event.get_sender_id())
 
@@ -591,8 +717,8 @@ class GPTImage2Plugin(Star):
             "\n"
             "参数组合示例：\n"
             "  /draw 16:9 赛博朋克夜景\n"
-            "  /draw 3:4@2k medium 一位少女\n"
-            "  /draw 21:9@4k high 电影海报\n"
+            "  /draw 3:4 2k medium 一位少女\n"
+            "  /draw 21:9 4k high 电影海报\n"
             "\n"
             "━━━ 图生图 ━━━\n"
             "引用一张图片后发送：\n"
