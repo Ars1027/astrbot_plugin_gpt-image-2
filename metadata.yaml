@@ -1,7 +1,7 @@
 name: "astrbot_plugin_gpt_image_2"
 display_name: "GPT-Image-2 文生图/图生图"
 desc: "调用 GPT-Image-2 API 生成图片，支持文生图和图生图（引用图片）"
-version: "v2.0.0"
+version: "v2.1.0"
 author: "Luochang"
 repo: "https://github.com/swt2665048148-arch/astrbot_plugin_gpt-image-2"
 astrbot_version: ">=4.16.0"

@@ -5,12 +5,16 @@ import json
 import re
 import time
 import traceback
+from typing import Any
 
 import aiohttp
+from pydantic import Field
+from pydantic.dataclasses import dataclass
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 
 # 支持的宽高比
 VALID_SIZES = {
@@ -49,6 +53,61 @@ IMAGE_CONTENT_TYPE_EXTENSIONS = {
     "image/gif": ".gif",
 }
 
+
+@dataclass
+class GenerateImageTool(FunctionTool):
+    plugin: Any = Field(default=None, exclude=True, repr=False)
+    name: str = "generate_image"
+    description: str = (
+        "调用 GPT-Image-2 真正提交图片生成任务。当用户要求画图、生成图片、"
+        "出图、改图、基于引用图片重绘或转换风格时，必须调用此工具。不要回复 "
+        "/draw 命令文本，不要使用 shell 查看插件文件。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "最终生图提示词，描述要生成或修改成什么画面。",
+                },
+                "size": {
+                    "type": "string",
+                    "description": "可选宽高比。",
+                    "enum": sorted(VALID_SIZES),
+                },
+                "resolution": {
+                    "type": "string",
+                    "description": "可选分辨率档位。",
+                    "enum": sorted(VALID_RESOLUTIONS),
+                },
+                "quality": {
+                    "type": "string",
+                    "description": "可选图片质量。",
+                    "enum": sorted(VALID_QUALITIES),
+                },
+                "use_quoted_image": {
+                    "type": "boolean",
+                    "description": "是否使用当前消息引用的图片做图生图，默认 true。",
+                },
+            },
+            "required": ["prompt"],
+        }
+    )
+
+    async def call(self, context, **kwargs) -> ToolExecResult:
+        if not self.plugin:
+            return "生成图片失败：插件实例未绑定。"
+
+        event = getattr(getattr(context, "context", None), "event", None)
+        if event is None:
+            event = getattr(context, "event", None)
+        if event is None:
+            return "生成图片失败：无法获取当前消息事件。"
+
+        return await self.plugin._invoke_generate_image_tool(event, **kwargs)
+
+
 @register(
     "gpt-image-2",
     "Luochang",
@@ -83,6 +142,11 @@ class GPTImage2Plugin(Star):
     async def initialize(self):
         """插件启动后调用"""
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+        try:
+            self.context.add_llm_tools(GenerateImageTool(plugin=self))
+            logger.info("GPT-Image-2 generate_image LLM Tool 已显式注册")
+        except Exception as e:
+            logger.error(f"注册 generate_image LLM Tool 失败: {e}")
         logger.info("GPT-Image-2 插件已初始化")
 
     async def terminate(self):
@@ -148,6 +212,49 @@ class GPTImage2Plugin(Star):
         if error or prompt != "__prompt__":
             return None
         return params
+
+    def _looks_like_draw_param_token(self, token: str) -> bool:
+        value = token.strip().lower()
+        return (
+            value == "auto"
+            or value in VALID_SIZES
+            or re.fullmatch(r"\d+:\d+", value) is not None
+            or value in VALID_RESOLUTIONS
+            or re.fullmatch(r"\d+k", value) is not None
+            or value in VALID_QUALITIES
+        )
+
+    def _parse_llm_draw_response(self, text: str) -> tuple[dict, str, str]:
+        """解析 LLM 错误输出的 /draw 文本；仅兜底兼容旧 @ 参数写法。"""
+        stripped = (text or "").strip()
+        if not re.match(r"^/draw(?:\s+|$)", stripped, flags=re.IGNORECASE):
+            return {}, "", ""
+
+        parts = stripped.split(None, 1)
+        if len(parts) < 2:
+            return {}, "", "请提供提示词，例如：/draw 4:3 2k medium 一只狗"
+
+        tokens = parts[1].strip().split()
+        normalized_tokens = []
+        reading_params = True
+        for token in tokens:
+            value = token.lower()
+            if reading_params and "@" in value:
+                pieces = [piece for piece in value.split("@") if piece]
+                if len(pieces) > 1 and all(
+                    self._looks_like_draw_param_token(piece) for piece in pieces
+                ):
+                    normalized_tokens.extend(pieces)
+                    continue
+
+            if reading_params and self._looks_like_draw_param_token(value):
+                normalized_tokens.append(value)
+                continue
+
+            reading_params = False
+            normalized_tokens.append(token)
+
+        return self._parse_draw_args(" ".join(normalized_tokens))
 
     def _validate_params(self, params: dict) -> tuple[bool, str]:
         """验证参数是否合法，返回 (valid, error_msg)"""
@@ -367,6 +474,87 @@ class GPTImage2Plugin(Star):
 
         return data_urls
 
+    async def _create_generation_task(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        params: dict | None = None,
+        use_quoted_image: bool = True,
+    ) -> str:
+        """创建生成任务并启动后台轮询，返回给用户展示的提交结果。"""
+        prompt = (prompt or "").strip()
+        if not prompt:
+            return "请提供提示词，例如：/draw 4:3 2k medium 一只狗"
+
+        params = params or {}
+
+        allowed, reason = await self._check_permission(event)
+        if not allowed:
+            return reason
+
+        valid, err_msg = self._validate_params(params)
+        if not valid:
+            return err_msg
+
+        final_params = {
+            "size": params.get("size", self.default_size),
+            "resolution": params.get("resolution", self.default_resolution),
+            "quality": params.get("quality", self.default_quality),
+        }
+
+        image_urls = []
+        if use_quoted_image:
+            image_urls = await self._get_quoted_image_urls(event)
+            if image_urls:
+                try:
+                    image_urls = await self._prepare_reference_images(image_urls)
+                except ValueError as e:
+                    logger.error(f"处理引用图片失败: {e}")
+                    return str(e)
+
+        sender_id = str(event.get_sender_id())
+
+        try:
+            submit_resp = await self._submit_task(prompt, final_params, image_urls)
+        except Exception as e:
+            logger.error(f"提交任务异常: {e}")
+            return "提交生成任务时发生内部错误。"
+
+        if "error" in submit_resp:
+            return f"提交任务失败：{submit_resp['error']}"
+
+        task_id = None
+        if submit_resp.get("code") == 200:
+            data_list = submit_resp.get("data", [])
+            if isinstance(data_list, list) and data_list:
+                task_id = data_list[0].get("task_id")
+
+        if not task_id:
+            return "API 未返回 task_id，请检查 API 配置。"
+
+        await self._inc_usage(sender_id)
+
+        task_info = {
+            "task_id": task_id,
+            "sender_id": sender_id,
+            "umo": event.unified_msg_origin,
+            "prompt": prompt,
+            "params": final_params,
+            "has_reference": bool(image_urls),
+            "status": "submitted",
+            "created_at": time.time(),
+        }
+        await self.put_kv_data(f"task_{task_id}", json.dumps(task_info))
+
+        mode_text = "图生图" if image_urls else "文生图"
+        asyncio.create_task(self._background_polling(task_id))
+        return (
+            f"🎨 {mode_text}任务已提交\n"
+            f"任务 ID：{task_id}\n"
+            f"参数：{final_params['size']} "
+            f"{final_params['resolution']} {final_params['quality']}"
+        )
+
     async def _poll_task(self, task_id: str) -> dict:
         """轮询任务状态，返回任务结果或错误"""
         headers = {"Authorization": f"Bearer {self.api_key}"}
@@ -580,6 +768,116 @@ class GPTImage2Plugin(Star):
             logger.error(f"获取引用图片失败: {e}")
             return []
 
+    # ========== LLM Tool 与兜底 ==========
+
+    def _coerce_bool(self, value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() not in {
+                "false",
+                "0",
+                "no",
+                "off",
+                "否",
+                "不",
+            }
+        return bool(value)
+
+    async def _invoke_generate_image_tool(
+        self,
+        event: AstrMessageEvent,
+        prompt: str,
+        size: str = "",
+        resolution: str = "",
+        quality: str = "",
+        use_quoted_image: bool = True,
+    ) -> str:
+        params = {}
+        if size:
+            params["size"] = str(size).strip().lower()
+        if resolution:
+            params["resolution"] = str(resolution).strip().lower()
+        if quality:
+            params["quality"] = str(quality).strip().lower()
+
+        use_quoted_image = self._coerce_bool(use_quoted_image)
+        logger.info(
+            "generate_image LLM Tool 被调用: "
+            f"size={params.get('size', self.default_size)}, "
+            f"resolution={params.get('resolution', self.default_resolution)}, "
+            f"quality={params.get('quality', self.default_quality)}, "
+            f"use_quoted_image={use_quoted_image}"
+        )
+
+        return await self._create_generation_task(
+            event,
+            prompt,
+            params,
+            use_quoted_image=use_quoted_image,
+        )
+
+    def _get_llm_response_text(self, response) -> str:
+        if isinstance(response, str):
+            return response
+        if isinstance(response, dict):
+            return str(response.get("completion_text") or response.get("content") or "")
+
+        for attr in ("completion_text", "content", "text"):
+            value = getattr(response, attr, None)
+            if isinstance(value, str):
+                return value
+
+        return ""
+
+    def _set_llm_response_text(self, response, text: str):
+        if isinstance(response, dict):
+            response["completion_text"] = text
+            response["content"] = text
+            return
+
+        for attr in ("completion_text", "content", "text"):
+            if hasattr(response, attr):
+                try:
+                    setattr(response, attr, text)
+                except Exception as e:
+                    logger.debug(f"更新 LLMResponse.{attr} 失败: {e}")
+
+    def _resolve_llm_response_hook_args(self, args: tuple, kwargs: dict):
+        event = kwargs.get("event")
+        response = kwargs.get("response") or kwargs.get("llm_response")
+
+        for arg in args:
+            if event is None and hasattr(arg, "get_sender_id"):
+                event = arg
+                continue
+            if response is None and (
+                isinstance(arg, dict)
+                or isinstance(arg, str)
+                or any(hasattr(arg, attr) for attr in ("completion_text", "content", "text"))
+            ):
+                response = arg
+
+        return event, response
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, *args, **kwargs):
+        event, response = self._resolve_llm_response_hook_args(args, kwargs)
+        if event is None or response is None:
+            logger.debug("LLM /draw 兜底跳过：无法解析 hook 参数")
+            return
+
+        text = self._get_llm_response_text(response).strip()
+        if not re.match(r"^/draw(?:\s+|$)", text, flags=re.IGNORECASE):
+            return
+
+        params, prompt, parse_error = self._parse_llm_draw_response(text)
+        if parse_error:
+            self._set_llm_response_text(response, parse_error)
+            return
+
+        logger.info("检测到 LLM 输出 /draw 文本，已拦截并转为内部生图任务")
+        result = await self._create_generation_task(event, prompt, params)
+        self._set_llm_response_text(response, result)
+
     # ========== 命令 ==========
 
     @filter.command("draw", priority=1)
@@ -599,12 +897,6 @@ class GPTImage2Plugin(Star):
         """
         event.stop_event()
 
-        # 权限检查
-        allowed, reason = await self._check_permission(event)
-        if not allowed:
-            yield event.plain_result(reason)
-            return
-
         parts = event.message_str.strip().split(None, 1)
         if len(parts) < 2:
             yield event.plain_result(
@@ -622,80 +914,8 @@ class GPTImage2Plugin(Star):
             yield event.plain_result(parse_error)
             return
 
-        # 验证参数
-        valid, err_msg = self._validate_params(params)
-        if not valid:
-            yield event.plain_result(err_msg)
-            return
-
-        # 合并默认参数
-        final_params = {
-            "size": params.get("size", self.default_size),
-            "resolution": params.get("resolution", self.default_resolution),
-            "quality": params.get("quality", self.default_quality),
-        }
-
-        # 获取并转存引用图片（图生图）
-        image_urls = await self._get_quoted_image_urls(event)
-        if image_urls:
-            try:
-                image_urls = await self._prepare_reference_images(image_urls)
-            except ValueError as e:
-                logger.error(f"处理引用图片失败: {e}")
-                yield event.plain_result(str(e))
-                return
-
-        sender_id = str(event.get_sender_id())
-
-        # 提交任务
-        try:
-            submit_resp = await self._submit_task(prompt, final_params, image_urls)
-        except Exception as e:
-            logger.error(f"提交任务异常: {e}")
-            yield event.plain_result("提交生成任务时发生内部错误。")
-            return
-
-        if "error" in submit_resp:
-            yield event.plain_result(f"提交任务失败：{submit_resp['error']}")
-            return
-
-        # 提取 task_id
-        task_id = None
-        if submit_resp.get("code") == 200:
-            data_list = submit_resp.get("data", [])
-            if isinstance(data_list, list) and data_list:
-                task_id = data_list[0].get("task_id")
-
-        if not task_id:
-            yield event.plain_result("API 未返回 task_id，请检查 API 配置。")
-            return
-
-        # 增加使用次数
-        await self._inc_usage(sender_id)
-
-        # 保存任务信息
-        task_info = {
-            "task_id": task_id,
-            "sender_id": sender_id,
-            "umo": event.unified_msg_origin,
-            "prompt": prompt,
-            "params": final_params,
-            "has_reference": bool(image_urls),
-            "status": "submitted",
-            "created_at": time.time(),
-        }
-        await self.put_kv_data(f"task_{task_id}", json.dumps(task_info))
-
-        # 回复用户
-        mode_text = "图生图" if image_urls else "文生图"
-        yield event.plain_result(
-            f"🎨 {mode_text}任务已提交\n"
-            f"任务 ID：{task_id}\n"
-            f"参数：{final_params['size']} {final_params['resolution']} {final_params['quality']}"
-        )
-
-        # 启动后台轮询
-        asyncio.create_task(self._background_polling(task_id))
+        result = await self._create_generation_task(event, prompt, params)
+        yield event.plain_result(result)
 
     @filter.command("drawhelp", priority=1)
     async def drawhelp(self, event: AstrMessageEvent):

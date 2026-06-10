@@ -106,6 +106,20 @@ pip install -r requirements.txt
 [引用图片] /draw 21:9 4k high 基于这张图生成电影海报
 ```
 
+### 自然语言调用
+
+插件会显式注册 `generate_image` LLM Tool。启用 AstrBot 的 LLM/Agent 工具调用后，用户可以直接用自然语言触发生成，无需手写 `/draw`：
+
+```
+帮我画一只 4:3 的狗，质量高一点
+生成一张 16:9 的赛博朋克城市夜景，用 2k 分辨率
+[引用图片] 把这张图改成动漫风格
+```
+
+LLM Tool 会复用 `/draw` 的权限、每日限额、引用图处理和后台轮询逻辑；最终图片仍会在任务完成后自动发送到原会话。
+
+如果日志里看到 Agent 调用了 `astrbot_execute_shell`，或者最终只是把 `/draw ...` 当作普通文本发出来，说明当前 Agent 没有优先选择 `generate_image` 工具。插件会兜底拦截 LLM 输出的 `/draw ...` 回复并转成内部任务提交；如果仍未触发，请检查 AngelHeart/Agent 的工具配置，确保 `generate_image` 在可用工具列表中，或降低/禁用 shell 工具的优先级。
+
 ## ⚙️ 配置说明
 
 | 配置项 | 说明 | 默认值 |
